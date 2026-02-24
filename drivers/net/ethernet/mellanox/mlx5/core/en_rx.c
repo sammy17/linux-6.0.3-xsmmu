@@ -58,6 +58,12 @@
 #include "devlink.h"
 #include "en/devlink.h"
 
+#ifdef CONFIG_IOMMU_DMA
+#include <linux/dma-iommu.h>
+#endif
+
+extern bool xsmmu_batch_unmap;
+
 static struct sk_buff *
 mlx5e_skb_from_cqe_mpwrq_linear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
 				u16 cqe_bcnt, u32 head_offset, u32 page_idx);
@@ -309,15 +315,79 @@ void mlx5e_page_dma_unmap(struct mlx5e_rq *rq, struct page *page)
 	page_pool_set_dma_addr(page, 0);
 }
 
+static inline void mlx5e_page_dma_unmap_no_sync(struct mlx5e_rq *rq,
+						struct page *page)
+{
+	dma_addr_t dma_addr = page_pool_get_dma_addr(page);
+
+	dma_unmap_page_attrs_no_sync(rq->pdev, dma_addr, PAGE_SIZE,
+				     rq->buff.map_dir, DMA_ATTR_SKIP_CPU_SYNC);
+	page_pool_set_dma_addr(page, 0);
+}
+
+void mlx5e_process_rx_release_batch(struct mlx5e_rq *rq)
+{
+	int i;
+
+	if (rq->pending_release_count == 0)
+		return;
+
+	dma_sync_device_iotlb(rq->pdev);
+
+	for (i = 0; i < rq->pending_release_count; i++) {
+		struct page *page = rq->pending_release[i].page;
+		bool recycle = rq->pending_release[i].recycle;
+
+		if (recycle)
+			page_pool_recycle_direct(rq->page_pool, page);
+		else {
+			page_pool_release_page(rq->page_pool, page);
+			put_page(page);
+		}
+	}
+
+	rq->pending_release_count = 0;
+}
+
 void mlx5e_page_release_dynamic(struct mlx5e_rq *rq, struct page *page, bool recycle)
 {
 	if (likely(recycle)) {
 		if (mlx5e_rx_cache_put(rq, page))
 			return;
 
+		if (xsmmu_batch_unmap) {
+			if (rq->pending_release_count >= iommu_napi_poll_threshold)
+				mlx5e_process_rx_release_batch(rq);
+
+			mlx5e_page_dma_unmap_no_sync(rq, page);
+			rq->pending_release[rq->pending_release_count].page = page;
+			rq->pending_release[rq->pending_release_count].recycle = true;
+			rq->pending_release_count++;
+#ifdef CONFIG_IOMMU_DMA
+			if (static_branch_unlikely(&iommu_print_poll_release_count_key))
+				rq->poll_release_count++;
+#endif
+			return;
+		}
+
 		mlx5e_page_dma_unmap(rq, page);
 		page_pool_recycle_direct(rq->page_pool, page);
 	} else {
+		if (xsmmu_batch_unmap) {
+			if (rq->pending_release_count >= iommu_napi_poll_threshold)
+				mlx5e_process_rx_release_batch(rq);
+
+			mlx5e_page_dma_unmap_no_sync(rq, page);
+			rq->pending_release[rq->pending_release_count].page = page;
+			rq->pending_release[rq->pending_release_count].recycle = false;
+			rq->pending_release_count++;
+#ifdef CONFIG_IOMMU_DMA
+			if (static_branch_unlikely(&iommu_print_poll_release_count_key))
+				rq->poll_release_count++;
+#endif
+			return;
+		}
+
 		mlx5e_page_dma_unmap(rq, page);
 		page_pool_release_page(rq->page_pool, page);
 		put_page(page);
@@ -2207,6 +2277,11 @@ int mlx5e_poll_rx_cq(struct mlx5e_cq *cq, int budget)
 	if (unlikely(!test_bit(MLX5E_RQ_STATE_ENABLED, &rq->state)))
 		return 0;
 
+#ifdef CONFIG_IOMMU_DMA
+	if (static_branch_unlikely(&iommu_print_poll_release_count_key))
+		rq->poll_release_count = 0;
+#endif
+
 	if (rq->cqd.left) {
 		work_done += mlx5e_decompress_cqes_cont(rq, cqwq, 0, budget);
 		if (work_done >= budget)
@@ -2241,6 +2316,15 @@ out:
 
 	if (rcu_access_pointer(rq->xdp_prog))
 		mlx5e_xdp_rx_poll_complete(rq);
+
+	if (xsmmu_batch_unmap)
+		mlx5e_process_rx_release_batch(rq);
+
+#ifdef CONFIG_IOMMU_DMA
+	if (static_branch_unlikely(&iommu_print_poll_release_count_key) &&
+	    rq->poll_release_count > 0)
+		iommu_debug_report_poll_release_count(rq->poll_release_count);
+#endif
 
 	mlx5_cqwq_update_db_record(cqwq);
 

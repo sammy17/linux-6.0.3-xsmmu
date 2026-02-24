@@ -67,6 +67,8 @@
 #include "qos.h"
 #include "en/trap.h"
 
+extern bool xsmmu_batch_unmap;
+
 bool mlx5e_check_fragmented_striding_rq_cap(struct mlx5_core_dev *mdev)
 {
 	bool striding_rq_umr, inline_umr;
@@ -563,6 +565,9 @@ static int mlx5e_alloc_rq(struct mlx5e_params *params,
 
 	rqp->wq.db_numa_node = node;
 	INIT_WORK(&rq->recover_work, mlx5e_rq_err_cqe_work);
+
+	rq->pending_release_count = 0;
+	rq->poll_release_count = 0;
 
 	if (params->xdp_prog)
 		bpf_prog_inc(params->xdp_prog);

@@ -760,6 +760,13 @@ struct mlx5e_rq {
 
 	struct work_struct     recover_work;
 
+	struct {
+		struct page *page;
+		bool recycle;
+	} pending_release[1024];
+	u16                    pending_release_count;
+	u32                    poll_release_count;
+
 	/* control */
 	struct mlx5_wq_ctrl    wq_ctrl;
 	__be32                 mkey_be;
