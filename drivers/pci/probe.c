@@ -25,6 +25,28 @@
 #define CARDBUS_LATENCY_TIMER	176	/* secondary latency timer */
 #define CARDBUS_RESERVE_BUSNR	3
 
+/*
+ * iommu_swbb_force - Force software bounce buffers for all PCIe devices.
+ *
+ * When set via the "iommu.swbb=1" boot parameter, every PCIe device is marked
+ * untrusted at probe time regardless of its position in the topology. This
+ * gives all PCIe devices the same IOMMU isolation that external-facing
+ * (e.g. Thunderbolt) devices normally receive: full DMA remapping, ATS
+ * disabled, and no IOMMU quirk bypass allowed.
+ */
+bool iommu_swbb_force __read_mostly;
+EXPORT_SYMBOL_GPL(iommu_swbb_force);
+
+static int __init iommu_swbb_setup(char *str)
+{
+	int ret = kstrtobool(str, &iommu_swbb_force);
+
+	if (!ret && iommu_swbb_force)
+		pr_info("IOMMU: software bounce buffers force-enabled for all PCIe devices\n");
+	return ret;
+}
+early_param("iommu.swbb", iommu_swbb_setup);
+
 static struct resource busn_resource = {
 	.name	= "PCI busn",
 	.start	= 0,
@@ -1590,6 +1612,16 @@ static void set_pcie_thunderbolt(struct pci_dev *dev)
 static void set_pcie_untrusted(struct pci_dev *dev)
 {
 	struct pci_dev *parent;
+
+	/*
+	 * When iommu.swbb=1 is set, treat every PCIe device as untrusted so
+	 * that all devices receive full IOMMU isolation: DMA remapping enforced,
+	 * ATS disabled, and IOMMU quirk bypasses blocked.
+	 */
+	if (iommu_swbb_force) {
+		dev->untrusted = true;
+		return;
+	}
 
 	/*
 	 * If the upstream bridge is untrusted we treat this device
