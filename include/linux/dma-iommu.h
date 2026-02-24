@@ -10,6 +10,7 @@
 
 #ifdef CONFIG_IOMMU_DMA
 #include <linux/dma-mapping.h>
+#include <linux/jump_label.h>
 #include <linux/iommu.h>
 #include <linux/msi.h>
 
@@ -42,6 +43,13 @@ void iommu_dma_free_cpu_cached_iovas(unsigned int cpu,
 		struct iommu_domain *domain);
 
 extern bool iommu_dma_forcedac;
+
+/* RX batch unmap flush threshold (iommu.napi_poll_threshold=<value>) */
+extern unsigned int iommu_napi_poll_threshold;
+
+/* Debug: poll release count tracking (iommu.print_poll_release_count=1) */
+extern struct static_key_false iommu_print_poll_release_count_key;
+void iommu_debug_report_poll_release_count(unsigned int count);
 
 #else /* CONFIG_IOMMU_DMA */
 

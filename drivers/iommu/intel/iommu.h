@@ -716,6 +716,7 @@ extern void qi_flush_context(struct intel_iommu *iommu, u16 did, u16 sid,
 			     u8 fm, u64 type);
 extern void qi_flush_iotlb(struct intel_iommu *iommu, u16 did, u64 addr,
 			  unsigned int size_order, u64 type);
+extern void qi_flush_domain_iotlb_hint(struct intel_iommu *iommu, u16 did);
 extern void qi_flush_dev_iotlb(struct intel_iommu *iommu, u16 sid, u16 pfsid,
 			u16 qdep, u64 addr, unsigned mask);
 
@@ -737,6 +738,8 @@ int qi_submit_sync(struct intel_iommu *iommu, struct qi_desc *desc,
 #define QI_OPT_WAIT_DRAIN		BIT(0)
 
 extern int dmar_ir_support(void);
+
+void intel_iommu_init_iotlb_stats(void);
 
 void *alloc_pgtable_page(int node);
 void free_pgtable_page(void *vaddr);
@@ -798,6 +801,8 @@ extern int iommu_calculate_agaw(struct intel_iommu *iommu);
 extern int iommu_calculate_max_sagaw(struct intel_iommu *iommu);
 extern int dmar_disabled;
 extern int intel_iommu_enabled;
+extern bool print_iotlb_inv_count;
+extern atomic64_t iotlb_unmapped_iova_pages;
 #else
 static inline int iommu_calculate_agaw(struct intel_iommu *iommu)
 {

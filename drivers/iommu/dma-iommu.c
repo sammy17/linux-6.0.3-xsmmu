@@ -70,6 +70,7 @@ struct iommu_dma_cookie {
 
 static DEFINE_STATIC_KEY_FALSE(iommu_deferred_attach_enabled);
 bool iommu_dma_forcedac __read_mostly;
+bool xsmmu_batch_unmap __read_mostly;
 
 static int __init iommu_dma_forcedac_setup(char *str)
 {
@@ -80,6 +81,83 @@ static int __init iommu_dma_forcedac_setup(char *str)
 	return ret;
 }
 early_param("iommu.forcedac", iommu_dma_forcedac_setup);
+
+static int __init xsmmu_setup(char *str)
+{
+	int ret = kstrtobool(str, &xsmmu_batch_unmap);
+
+	if (!ret && xsmmu_batch_unmap)
+		pr_info("XSMMU batch unmap mode enabled\n");
+	return ret;
+}
+early_param("iommu.xsmmu", xsmmu_setup);
+EXPORT_SYMBOL(xsmmu_batch_unmap);
+
+/* RX batch unmap flush threshold (capped by driver pending_release array size) */
+#define IOMMU_NAPI_POLL_THRESHOLD_MAX 1024
+unsigned int iommu_napi_poll_threshold __read_mostly = IOMMU_NAPI_POLL_THRESHOLD_MAX;
+
+static int __init iommu_napi_poll_threshold_setup(char *str)
+{
+	unsigned int val;
+	int ret = kstrtouint(str, 0, &val);
+
+	if (!ret) {
+		if (val < 1)
+			val = 1;
+		if (val > IOMMU_NAPI_POLL_THRESHOLD_MAX)
+			val = IOMMU_NAPI_POLL_THRESHOLD_MAX;
+		iommu_napi_poll_threshold = val;
+		pr_info("IOMMU NAPI poll threshold set to %u\n", val);
+	}
+	return ret;
+}
+early_param("iommu.napi_poll_threshold", iommu_napi_poll_threshold_setup);
+EXPORT_SYMBOL(iommu_napi_poll_threshold);
+
+/*
+ * Debug: track max RX poll release count for tuning pending_release array size.
+ * Set iommu.print_poll_release_count=1 to enable. Prints only when max changes.
+ * Zero overhead when not set (static key).
+ */
+DEFINE_STATIC_KEY_FALSE(iommu_print_poll_release_count_key);
+static atomic_long_t iommu_max_poll_release_count __read_mostly = ATOMIC_LONG_INIT(0);
+
+static int __init iommu_print_poll_release_count_setup(char *str)
+{
+	bool enable;
+	int ret = kstrtobool(str, &enable);
+
+	if (!ret && enable) {
+		atomic_long_set(&iommu_max_poll_release_count, 0);
+		static_branch_enable(&iommu_print_poll_release_count_key);
+		pr_info("IOMMU poll release count tracking enabled\n");
+	}
+	return ret;
+}
+early_param("iommu.print_poll_release_count", iommu_print_poll_release_count_setup);
+
+void iommu_debug_report_poll_release_count(unsigned int count)
+{
+	unsigned long prev_max, new_max;
+
+	if (!count)
+		return;
+
+	prev_max = atomic_long_read(&iommu_max_poll_release_count);
+	while (count > prev_max) {
+		new_max = atomic_long_cmpxchg(&iommu_max_poll_release_count,
+					      prev_max, count);
+		if (new_max == prev_max) {
+			pr_info("iommu: max poll release count: %u (new record)\n",
+				count);
+			return;
+		}
+		prev_max = new_max;
+	}
+}
+EXPORT_SYMBOL(iommu_debug_report_poll_release_count);
+EXPORT_SYMBOL(iommu_print_poll_release_count_key);
 
 /* Number of entries per flush queue */
 #define IOVA_FQ_SIZE	256
@@ -521,6 +599,24 @@ static bool dev_use_swiotlb(struct device *dev)
 	return IS_ENABLED(CONFIG_SWIOTLB) && dev_is_untrusted(dev);
 }
 
+void iommu_dma_unmap_swiotlb_no_sync(struct device *dev, dma_addr_t dma_addr,
+		size_t size, enum dma_data_direction dir,
+		unsigned long attrs)
+{
+	struct iommu_domain *domain = iommu_get_dma_domain(dev);
+	phys_addr_t phys;
+
+	phys = iommu_iova_to_phys(domain, dma_addr);
+	if (WARN_ON(!phys))
+		return;
+
+	__iommu_dma_unmap_no_sync(dev, dma_addr, size);
+
+	if (unlikely(is_swiotlb_buffer(dev, phys)))
+		swiotlb_tbl_unmap_single(dev, phys, size, dir, attrs);
+}
+EXPORT_SYMBOL_GPL(iommu_dma_unmap_swiotlb_no_sync);
+
 /**
  * iommu_dma_init_domain - Initialise a DMA mapping domain
  * @domain: IOMMU domain previously prepared by iommu_get_dma_cookie()
@@ -688,8 +784,53 @@ static void __iommu_dma_unmap(struct device *dev, dma_addr_t dma_addr,
 	unmapped = iommu_unmap_fast(domain, dma_addr, size, &iotlb_gather);
 	WARN_ON(unmapped != size);
 
-	if (!iotlb_gather.queued)
+	/*
+	 * When xsmmu_batch_unmap is enabled, always perform strict IOTLB
+	 * invalidation for security. This ensures fallback/error paths that
+	 * don't use the _no_sync variants still maintain security by
+	 * immediately invalidating IOTLB entries.
+	 *
+	 * When xsmmu_batch_unmap is disabled, use standard deferred invalidation
+	 * (sync only if not queued to flush queue).
+	 */
+	if (xsmmu_batch_unmap || !iotlb_gather.queued)
 		iommu_iotlb_sync(domain, &iotlb_gather);
+	iommu_dma_free_iova(cookie, dma_addr, size, &iotlb_gather);
+}
+
+/**
+ * __iommu_dma_unmap_no_sync - Unmap without IOTLB invalidation for batching
+ * @dev: device
+ * @dma_addr: DMA address to unmap
+ * @size: size of mapping
+ *
+ * Performs DMA unmap and adds the IOVA to the flush queue without triggering
+ * IOTLB invalidation. This allows batching multiple unmaps followed by a
+ * single domain-wide IOTLB invalidation via iommu_dma_sync_device_iotlb().
+ *
+ * Security note: Pages remain in the flush queue and are not freed until
+ * the IOTLB is synchronized and later fully invalidated (including page walk
+ * cache).
+ */
+static void __iommu_dma_unmap_no_sync(struct device *dev, dma_addr_t dma_addr,
+		size_t size)
+{
+	struct iommu_domain *domain = iommu_get_dma_domain(dev);
+	struct iommu_dma_cookie *cookie = domain->iova_cookie;
+	struct iova_domain *iovad = &cookie->iovad;
+	size_t iova_off = iova_offset(iovad, dma_addr);
+	struct iommu_iotlb_gather iotlb_gather;
+	size_t unmapped;
+
+	dma_addr -= iova_off;
+	size = iova_align(iovad, size + iova_off);
+	iommu_iotlb_gather_init(&iotlb_gather);
+	iotlb_gather.queued = READ_ONCE(cookie->fq_domain);
+
+	unmapped = iommu_unmap_fast(domain, dma_addr, size, &iotlb_gather);
+	WARN_ON(unmapped != size);
+
+	/* Skip IOTLB sync - will be done via explicit sync call */
 	iommu_dma_free_iova(cookie, dma_addr, size, &iotlb_gather);
 }
 
@@ -1543,6 +1684,29 @@ static size_t iommu_dma_opt_mapping_size(void)
 	return iova_rcache_range();
 }
 
+/**
+ * iommu_dma_sync_device_iotlb - Synchronously invalidate domain IOTLB
+ * @dev: device
+ *
+ * Issues domain-wide IOTLB invalidation with invalidation hint set (IH=1),
+ * which skips page walk cache. Waits synchronously for completion.
+ *
+ * Must be called after a batch of dma_unmap_*_no_sync() calls to ensure
+ * security - prevents device from accessing freed memory via stale IOTLB.
+ *
+ * Only functional when xsmmu_batch_unmap mode is enabled (iommu.xsmmu=1)
+ * and the underlying IOMMU driver provides ->sync_domain_iotlb().
+ */
+void iommu_dma_sync_device_iotlb(struct device *dev)
+{
+	struct iommu_domain *domain = iommu_get_dma_domain(dev);
+
+	if (xsmmu_batch_unmap && domain->ops &&
+	    domain->ops->sync_domain_iotlb)
+		domain->ops->sync_domain_iotlb(domain);
+}
+EXPORT_SYMBOL_GPL(iommu_dma_sync_device_iotlb);
+
 static const struct dma_map_ops iommu_dma_ops = {
 	.flags			= DMA_F_PCI_P2PDMA_SUPPORTED,
 	.alloc			= iommu_dma_alloc,
@@ -1555,6 +1719,8 @@ static const struct dma_map_ops iommu_dma_ops = {
 	.get_sgtable		= iommu_dma_get_sgtable,
 	.map_page		= iommu_dma_map_page,
 	.unmap_page		= iommu_dma_unmap_page,
+	.unmap_page_no_sync	= iommu_dma_unmap_swiotlb_no_sync,
+	.sync_device_iotlb	= iommu_dma_sync_device_iotlb,
 	.map_sg			= iommu_dma_map_sg,
 	.unmap_sg		= iommu_dma_unmap_sg,
 	.sync_single_for_cpu	= iommu_dma_sync_single_for_cpu,

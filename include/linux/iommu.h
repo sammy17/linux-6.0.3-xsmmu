@@ -282,6 +282,8 @@ struct iommu_ops {
  *                           specific mechanisms.
  * @enable_nesting: Enable nesting
  * @set_pgtable_quirks: Set io page table quirks (IO_PGTABLE_QUIRK_*)
+ * @sync_domain_iotlb: Perform domain-wide IOTLB invalidation for batch unmap
+ *                     optimisations (optional, IOMMU-specific)
  * @free: Release the domain after use.
  */
 struct iommu_domain_ops {
@@ -312,6 +314,8 @@ struct iommu_domain_ops {
 	int (*enable_nesting)(struct iommu_domain *domain);
 	int (*set_pgtable_quirks)(struct iommu_domain *domain,
 				  unsigned long quirks);
+
+	void (*sync_domain_iotlb)(struct iommu_domain *domain);
 
 	void (*free)(struct iommu_domain *domain);
 };

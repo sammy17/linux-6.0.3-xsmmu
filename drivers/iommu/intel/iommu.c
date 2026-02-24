@@ -24,6 +24,7 @@
 #include <linux/spinlock.h>
 #include <linux/syscore_ops.h>
 #include <linux/tboot.h>
+#include <linux/atomic.h>
 
 #include "iommu.h"
 #include "../irq_remapping.h"
@@ -4048,6 +4049,10 @@ int __init intel_iommu_init(void)
 
 	pr_info("Intel(R) Virtualization Technology for Directed I/O\n");
 
+	/* Initialize IOTLB invalidation statistics if enabled */
+	if (print_iotlb_inv_count)
+		intel_iommu_init_iotlb_stats();
+
 	intel_iommu_enabled = 1;
 
 	return 0;
@@ -4328,6 +4333,9 @@ static size_t intel_iommu_unmap(struct iommu_domain *domain,
 
 	iommu_iotlb_gather_add_page(domain, gather, iova, size);
 
+	if (print_iotlb_inv_count)
+		atomic64_add(size >> VTD_PAGE_SHIFT, &iotlb_unmapped_iova_pages);
+
 	return size;
 }
 
@@ -4362,6 +4370,29 @@ static void intel_iommu_tlb_sync(struct iommu_domain *domain,
 				      list_empty(&gather->freelist), 0);
 
 	put_pages_list(&gather->freelist);
+}
+
+/**
+ * intel_sync_domain_iotlb - Synchronously invalidate domain IOTLB with hint
+ * @domain: iommu domain
+ *
+ * Performs domain-selective IOTLB invalidation with invalidation hint (IH=1)
+ * set, which skips page walk cache invalidation. This is used for batch unmap
+ * optimization where:
+ * 1. Multiple pages are unmapped and added to flush queue
+ * 2. This function invalidates IOTLB entries (but not page walk cache)
+ * 3. Pages remain in flush queue until full invalidation clears page walk cache
+ *
+ * Note: Invalidates the entire domain (all devices sharing this domain).
+ */
+static void intel_sync_domain_iotlb(struct iommu_domain *domain)
+{
+	struct dmar_domain *dmar_domain = to_dmar_domain(domain);
+	struct iommu_domain_info *info;
+	unsigned long i;
+
+	xa_for_each(&dmar_domain->iommu_array, i, info)
+		qi_flush_domain_iotlb_hint(info->iommu, info->did);
 }
 
 static phys_addr_t intel_iommu_iova_to_phys(struct iommu_domain *domain,
@@ -4774,6 +4805,7 @@ const struct iommu_ops intel_iommu_ops = {
 		.flush_iotlb_all        = intel_flush_iotlb_all,
 		.iotlb_sync		= intel_iommu_tlb_sync,
 		.iova_to_phys		= intel_iommu_iova_to_phys,
+		.sync_domain_iotlb	= intel_sync_domain_iotlb,
 		.free			= intel_iommu_domain_free,
 		.enforce_cache_coherency = intel_iommu_enforce_cache_coherency,
 	}

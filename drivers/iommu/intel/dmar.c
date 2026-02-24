@@ -28,6 +28,8 @@
 #include <linux/iommu.h>
 #include <linux/numa.h>
 #include <linux/limits.h>
+#include <linux/atomic.h>
+#include <linux/workqueue.h>
 #include <asm/irq_remapping.h>
 
 #include "iommu.h"
@@ -61,6 +63,27 @@ LIST_HEAD(dmar_drhd_units);
 struct acpi_table_header * __initdata dmar_tbl;
 static int dmar_dev_scope_status = 1;
 static DEFINE_IDA(dmar_seq_ids);
+
+/*
+ * IOTLB invalidation statistics for performance analysis
+ */
+bool print_iotlb_inv_count __read_mostly;
+static atomic64_t iotlb_inv_psi_count;        /* Page-selective invalidations */
+static atomic64_t iotlb_inv_dsi_count;        /* Domain-selective invalidations */
+static atomic64_t iotlb_inv_global_count;     /* Global invalidations */
+static atomic64_t iotlb_inv_dsi_xsmmu_count;  /* xSMMU DSI with IH=1 */
+atomic64_t iotlb_unmapped_iova_pages;         /* 4KB IOVA pages unmapped */
+static struct delayed_work iotlb_stats_work;
+
+static int __init print_iotlb_inv_count_setup(char *str)
+{
+	int ret = kstrtobool(str, &print_iotlb_inv_count);
+
+	if (!ret && print_iotlb_inv_count)
+		pr_info("IOTLB invalidation counting enabled (10s reporting)\n");
+	return ret;
+}
+early_param("iommu.print_iotlb_inv_count", print_iotlb_inv_count_setup);
 
 static int alloc_iommu(struct dmar_drhd_unit *drhd);
 static void free_iommu(struct intel_iommu *iommu);
@@ -1486,6 +1509,16 @@ void qi_flush_iotlb(struct intel_iommu *iommu, u16 did, u64 addr,
 	desc.qw3 = 0;
 
 	qi_submit_sync(iommu, &desc, 1, 0);
+
+	/* Count invalidation by type for statistics */
+	if (print_iotlb_inv_count) {
+		if (type == DMA_TLB_PSI_FLUSH)
+			atomic64_inc(&iotlb_inv_psi_count);
+		else if (type == DMA_TLB_DSI_FLUSH)
+			atomic64_inc(&iotlb_inv_dsi_count);
+		else if (type == DMA_TLB_GLOBAL_FLUSH)
+			atomic64_inc(&iotlb_inv_global_count);
+	}
 }
 
 void qi_flush_dev_iotlb(struct intel_iommu *iommu, u16 sid, u16 pfsid,
@@ -1508,6 +1541,102 @@ void qi_flush_dev_iotlb(struct intel_iommu *iommu, u16 sid, u16 pfsid,
 	desc.qw3 = 0;
 
 	qi_submit_sync(iommu, &desc, 1, 0);
+
+	/* Count device IOTLB invalidation (device-level PSI) */
+	if (print_iotlb_inv_count)
+		atomic64_inc(&iotlb_inv_psi_count);
+}
+
+/*
+ * iotlb_stats_work_fn - Periodic handler to print IOTLB invalidation statistics
+ *
+ * Prints two lines every 10 seconds:
+ *
+ * Line 1 - invalidation breakdown and per-second rates:
+ *   IOMMU 10s inv: Total=T (T.T/s), PSI=X (X.X/s), DSI=Y (Y.Y/s),
+ *                  DSI_xSMMU=Z (Z.Z/s), Global=W
+ *
+ * Line 2 - per-IOVA-page metrics (only when unmapped page count > 0):
+ *   IOMMU 10s inv/page: IOVA_unmapped=P (P.P/s), inv/page=I.III,
+ *                       DSI_xSMMU/page=D.DDD
+ *
+ * inv/page and DSI_xSMMU/page allow direct comparison with prior work that
+ * normalises invalidation cost by the number of 4KB IOVA pages unmapped,
+ * independent of the achieved throughput.
+ */
+static void iotlb_stats_work_fn(struct work_struct *work)
+{
+	u64 psi, dsi, global, dsi_xsmmu, total, pages;
+
+	/* Read and reset all counters atomically over the 10s window */
+	psi       = atomic64_xchg(&iotlb_inv_psi_count, 0);
+	dsi       = atomic64_xchg(&iotlb_inv_dsi_count, 0);
+	global    = atomic64_xchg(&iotlb_inv_global_count, 0);
+	dsi_xsmmu = atomic64_xchg(&iotlb_inv_dsi_xsmmu_count, 0);
+	pages     = atomic64_xchg(&iotlb_unmapped_iova_pages, 0);
+
+	total = psi + dsi + global;
+
+	/*
+	 * Line 1: invalidation type breakdown.
+	 * Rates are expressed as X.X/s (one decimal place) by dividing the
+	 * 10s window count by 10 for the integer part and taking mod 10 for
+	 * the single fractional digit.
+	 */
+	pr_info("IOMMU 10s inv: Total=%llu (%llu.%llu/s), PSI=%llu (%llu.%llu/s), "
+		"DSI=%llu (%llu.%llu/s), DSI_xSMMU=%llu (%llu.%llu/s), Global=%llu\n",
+		total, total / 10, total % 10,
+		psi,   psi   / 10, psi   % 10,
+		dsi,   dsi   / 10, dsi   % 10,
+		dsi_xsmmu, dsi_xsmmu / 10, dsi_xsmmu % 10,
+		global);
+
+	/*
+	 * Line 2: per-IOVA-page efficiency metrics.
+	 * Only printed when at least one page was unmapped during the window
+	 * (avoids division by zero and noisy idle output).
+	 *
+	 * inv/page and DSI_xSMMU/page are formatted as X.XXX (three decimal
+	 * places) to resolve small ratios, e.g. 0.001 inv/page when one
+	 * domain-wide invalidation covers thousands of unmapped pages.
+	 *
+	 * Overflow check: multiplying a u64 counter by 1000 is safe for any
+	 * realistic 10s window count (would require ~1.8e16 invalidations to
+	 * overflow a u64).
+	 */
+	if (pages > 0) {
+		pr_info("IOMMU 10s inv/page: IOVA_unmapped=%llu (%llu.%llu/s), "
+			"inv/page=%llu.%03llu, DSI_xSMMU/page=%llu.%03llu\n",
+			pages, pages / 10, pages % 10,
+			total / pages,       (total * 1000 / pages) % 1000,
+			dsi_xsmmu / pages,   (dsi_xsmmu * 1000 / pages) % 1000);
+	}
+
+	/* Reschedule for next reporting interval */
+	schedule_delayed_work(&iotlb_stats_work, msecs_to_jiffies(10000));
+}
+
+/**
+ * intel_iommu_init_iotlb_stats - Initialize IOTLB invalidation statistics
+ *
+ * Called during IOMMU initialization when print_iotlb_inv_count is enabled.
+ * Sets up and starts the delayed work that periodically prints invalidation
+ * statistics every 10 seconds.
+ */
+void intel_iommu_init_iotlb_stats(void)
+{
+	/* Initialize counters to zero */
+	atomic64_set(&iotlb_inv_psi_count, 0);
+	atomic64_set(&iotlb_inv_dsi_count, 0);
+	atomic64_set(&iotlb_inv_global_count, 0);
+	atomic64_set(&iotlb_inv_dsi_xsmmu_count, 0);
+	atomic64_set(&iotlb_unmapped_iova_pages, 0);
+
+	/* Initialize and schedule the delayed work */
+	INIT_DELAYED_WORK(&iotlb_stats_work, iotlb_stats_work_fn);
+	schedule_delayed_work(&iotlb_stats_work, msecs_to_jiffies(10000));
+
+	pr_info("IOTLB invalidation statistics enabled, reporting every 10s\n");
 }
 
 /* PASID-based IOTLB invalidation */
@@ -1549,6 +1678,44 @@ void qi_flush_piotlb(struct intel_iommu *iommu, u16 did, u32 pasid, u64 addr,
 	}
 
 	qi_submit_sync(iommu, &desc, 1, 0);
+}
+
+/**
+ * qi_flush_domain_iotlb_hint - Flush domain IOTLB with invalidation hint
+ * @iommu: intel iommu
+ * @did: domain id
+ *
+ * Performs domain-selective IOTLB invalidation with invalidation hint (IH=1)
+ * set, which skips page walk cache invalidation. Used for batch unmap
+ * optimization where pages remain in flush queue until full invalidation.
+ * Waits synchronously for invalidation completion.
+ */
+void qi_flush_domain_iotlb_hint(struct intel_iommu *iommu, u16 did)
+{
+	u8 dw = 0, dr = 0;
+	struct qi_desc desc;
+	int ih = 1;  /* Set invalidation hint to skip page walk cache */
+
+	if (cap_write_drain(iommu->cap))
+		dw = 1;
+
+	if (cap_read_drain(iommu->cap))
+		dr = 1;
+
+	/* Domain-selective invalidation (DSI) with IH=1 */
+	desc.qw0 = QI_IOTLB_DID(did) | QI_IOTLB_DR(dr) | QI_IOTLB_DW(dw)
+		| QI_IOTLB_GRAN(DMA_TLB_DSI_FLUSH) | QI_IOTLB_TYPE;
+	desc.qw1 = QI_IOTLB_IH(ih);  /* IH=1, no address/size needed for DSI */
+	desc.qw2 = 0;
+	desc.qw3 = 0;
+
+	qi_submit_sync(iommu, &desc, 1, 0);
+
+	/* Count xSMMU-specific DSI invalidations for statistics */
+	if (print_iotlb_inv_count) {
+		atomic64_inc(&iotlb_inv_dsi_count);
+		atomic64_inc(&iotlb_inv_dsi_xsmmu_count);
+	}
 }
 
 /* PASID-based device IOTLB Invalidate */
