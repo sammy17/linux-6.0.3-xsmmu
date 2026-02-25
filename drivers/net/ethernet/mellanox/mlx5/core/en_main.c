@@ -786,6 +786,12 @@ static void mlx5e_free_rq(struct mlx5e_rq *rq)
 		mlx5e_page_release_dynamic(rq, dma_info->page, false);
 	}
 
+	/* Ensure any batched page releases from the page_cache cleanup are
+	 * flushed before tearing down the page_pool.
+	 */
+	if (xsmmu_batch_unmap)
+		mlx5e_process_rx_release_batch(rq);
+
 	xdp_rxq_info_unreg(&rq->xdp_rxq);
 	page_pool_destroy(rq->page_pool);
 	mlx5_wq_destroy(&rq->wq_ctrl);
@@ -1015,6 +1021,12 @@ void mlx5e_free_rx_descs(struct mlx5e_rq *rq)
 		}
 	}
 
+	/* Flush any batched RX page releases accumulated during descriptor
+	 * cleanup. This is a non-datapath context, so we must explicitly
+	 * process the batch instead of relying on NAPI.
+	 */
+	if (xsmmu_batch_unmap)
+		mlx5e_process_rx_release_batch(rq);
 }
 
 int mlx5e_open_rq(struct mlx5e_params *params, struct mlx5e_rq_param *param,

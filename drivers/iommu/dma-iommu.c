@@ -599,6 +599,10 @@ static bool dev_use_swiotlb(struct device *dev)
 	return IS_ENABLED(CONFIG_SWIOTLB) && dev_is_untrusted(dev);
 }
 
+/* Forward declaration for batched-unmap helper used below */
+static void __iommu_dma_unmap_no_sync(struct device *dev, dma_addr_t dma_addr,
+				      size_t size);
+
 void iommu_dma_unmap_swiotlb_no_sync(struct device *dev, dma_addr_t dma_addr,
 		size_t size, enum dma_data_direction dir,
 		unsigned long attrs)
