@@ -117,6 +117,31 @@ early_param("iommu.napi_poll_threshold", iommu_napi_poll_threshold_setup);
 EXPORT_SYMBOL(iommu_napi_poll_threshold);
 
 /*
+ * xSMMU TX path: when num_dma <= this threshold, use strict (per-segment)
+ * IOTLB invalidation to preserve other IOTLB entries; when num_dma > threshold,
+ * use batched unmap + single domain-wide sync. Default 2.
+ */
+#define IOMMU_XSMMU_TX_STRICT_THRESHOLD_MAX 255
+unsigned int iommu_xsmmu_tx_strict_threshold __read_mostly = 2;
+
+static int __init iommu_xsmmu_tx_strict_threshold_setup(char *str)
+{
+	unsigned int val;
+	int ret = kstrtouint(str, 0, &val);
+
+	if (!ret) {
+		if (val > IOMMU_XSMMU_TX_STRICT_THRESHOLD_MAX)
+			val = IOMMU_XSMMU_TX_STRICT_THRESHOLD_MAX;
+		iommu_xsmmu_tx_strict_threshold = val;
+		pr_info("IOMMU xSMMU TX strict threshold set to %u (num_dma <= %u -> strict)\n",
+			val, val);
+	}
+	return ret;
+}
+early_param("iommu.xsmmu_tx_strict_threshold", iommu_xsmmu_tx_strict_threshold_setup);
+EXPORT_SYMBOL(iommu_xsmmu_tx_strict_threshold);
+
+/*
  * Debug: track max RX poll release count for tuning pending_release array size.
  * Set iommu.print_poll_release_count=1 to enable. Prints only when max changes.
  * Zero overhead when not set (static key).

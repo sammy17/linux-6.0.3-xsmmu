@@ -43,22 +43,24 @@
 #include <net/ipv6.h>
 
 extern bool xsmmu_batch_unmap;
+extern unsigned int iommu_xsmmu_tx_strict_threshold;
 
 static void mlx5e_dma_unmap_wqe_err(struct mlx5e_txqsq *sq, u8 num_dma)
 {
 	int i;
+	bool batch = xsmmu_batch_unmap && num_dma > iommu_xsmmu_tx_strict_threshold;
 
 	for (i = 0; i < num_dma; i++) {
 		struct mlx5e_sq_dma *last_pushed_dma =
 			mlx5e_dma_get(sq, --sq->dma_fifo_pc);
 
-		if (xsmmu_batch_unmap)
+		if (batch)
 			mlx5e_tx_dma_unmap_no_sync(sq->pdev, last_pushed_dma);
 		else
 			mlx5e_tx_dma_unmap(sq->pdev, last_pushed_dma);
 	}
 
-	if (xsmmu_batch_unmap && num_dma > 0)
+	if (batch)
 		dma_sync_device_iotlb(sq->pdev);
 }
 
@@ -736,17 +738,18 @@ static void mlx5e_tx_wi_dma_unmap(struct mlx5e_txqsq *sq, struct mlx5e_tx_wqe_in
 				  u32 *dma_fifo_cc)
 {
 	int i;
+	bool batch = xsmmu_batch_unmap && wi->num_dma > iommu_xsmmu_tx_strict_threshold;
 
 	for (i = 0; i < wi->num_dma; i++) {
 		struct mlx5e_sq_dma *dma = mlx5e_dma_get(sq, (*dma_fifo_cc)++);
 
-		if (xsmmu_batch_unmap)
+		if (batch)
 			mlx5e_tx_dma_unmap_no_sync(sq->pdev, dma);
 		else
 			mlx5e_tx_dma_unmap(sq->pdev, dma);
 	}
 
-	if (xsmmu_batch_unmap && wi->num_dma > 0)
+	if (batch)
 		dma_sync_device_iotlb(sq->pdev);
 }
 
