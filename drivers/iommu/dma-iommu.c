@@ -29,6 +29,7 @@
 #include <linux/spinlock.h>
 #include <linux/swiotlb.h>
 #include <linux/vmalloc.h>
+#include <linux/workqueue.h>
 
 struct iommu_dma_msi_page {
 	struct list_head	list;
@@ -123,6 +124,55 @@ EXPORT_SYMBOL(iommu_napi_poll_threshold);
 DEFINE_STATIC_KEY_FALSE(iommu_print_poll_release_count_key);
 static atomic_long_t iommu_max_poll_release_count __read_mostly = ATOMIC_LONG_INIT(0);
 
+/* Aggregated RX poll release statistics over 10s windows */
+static atomic64_t iommu_poll_release_bufs __read_mostly;
+static atomic64_t iommu_poll_release_polls __read_mostly;
+static struct delayed_work iommu_poll_stats_work;
+static bool iommu_poll_stats_enabled;
+
+static void iommu_poll_stats_work_fn(struct work_struct *work)
+{
+	u64 bufs, polls;
+
+	/* Snapshot and reset 10s window counters */
+	bufs  = atomic64_xchg(&iommu_poll_release_bufs, 0);
+	polls = atomic64_xchg(&iommu_poll_release_polls, 0);
+
+	if (polls) {
+		/*
+		 * Report:
+		 * - total polls and per-second rate,
+		 * - total released buffers and per-second rate,
+		 * - average buffers released per poll (three decimal places).
+		 */
+		pr_info("iommu: 10s RX poll release: polls=%llu (%llu.%llu/s), "
+			"buffers=%llu (%llu.%llu/s), avg_bufs/poll=%llu.%03llu\n",
+			polls, polls / 10, polls % 10,
+			bufs,   bufs   / 10, bufs   % 10,
+			bufs / polls, (bufs * 1000 / polls) % 1000);
+	}
+
+	/* Reschedule next 10s window while debug tracking remains enabled */
+	if (iommu_poll_stats_enabled)
+		schedule_delayed_work(&iommu_poll_stats_work,
+				      msecs_to_jiffies(10000));
+}
+
+static int __init iommu_poll_stats_init(void)
+{
+	if (!iommu_poll_stats_enabled)
+		return 0;
+
+	atomic64_set(&iommu_poll_release_bufs, 0);
+	atomic64_set(&iommu_poll_release_polls, 0);
+	INIT_DELAYED_WORK(&iommu_poll_stats_work, iommu_poll_stats_work_fn);
+	schedule_delayed_work(&iommu_poll_stats_work, msecs_to_jiffies(10000));
+
+	pr_info("IOMMU RX poll release statistics enabled, reporting every 10s\n");
+	return 0;
+}
+late_initcall(iommu_poll_stats_init);
+
 static int __init iommu_print_poll_release_count_setup(char *str)
 {
 	bool enable;
@@ -131,6 +181,7 @@ static int __init iommu_print_poll_release_count_setup(char *str)
 	if (!ret && enable) {
 		atomic_long_set(&iommu_max_poll_release_count, 0);
 		static_branch_enable(&iommu_print_poll_release_count_key);
+		iommu_poll_stats_enabled = true;
 		pr_info("IOMMU poll release count tracking enabled\n");
 	}
 	return ret;
@@ -140,6 +191,10 @@ early_param("iommu.print_poll_release_count", iommu_print_poll_release_count_set
 void iommu_debug_report_poll_release_count(unsigned int count)
 {
 	unsigned long prev_max, new_max;
+
+	/* Always account this NAPI poll in the aggregated statistics. */
+	atomic64_add(count, &iommu_poll_release_bufs);
+	atomic64_inc(&iommu_poll_release_polls);
 
 	if (!count)
 		return;

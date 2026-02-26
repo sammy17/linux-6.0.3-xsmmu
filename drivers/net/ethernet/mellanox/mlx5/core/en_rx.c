@@ -2322,7 +2322,7 @@ out:
 
 #ifdef CONFIG_IOMMU_DMA
 	if (static_branch_unlikely(&iommu_print_poll_release_count_key) &&
-	    rq->poll_release_count > 0)
+	    rq->poll_release_count >= 0)
 		iommu_debug_report_poll_release_count(rq->poll_release_count);
 #endif
 

@@ -658,6 +658,7 @@ typedef void (*mlx5e_fp_shampo_dealloc_hd)(struct mlx5e_rq*, u16, u16, bool);
 
 int mlx5e_rq_set_handlers(struct mlx5e_rq *rq, struct mlx5e_params *params, bool xsk);
 void mlx5e_rq_set_trap_handlers(struct mlx5e_rq *rq, struct mlx5e_params *params);
+void mlx5e_process_rx_release_batch(struct mlx5e_rq *rq);
 
 enum mlx5e_rq_flag {
 	MLX5E_RQ_FLAG_XDP_XMIT,
