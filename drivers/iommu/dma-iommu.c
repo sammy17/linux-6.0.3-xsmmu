@@ -142,6 +142,23 @@ early_param("iommu.xsmmu_tx_strict_threshold", iommu_xsmmu_tx_strict_threshold_s
 EXPORT_SYMBOL(iommu_xsmmu_tx_strict_threshold);
 
 /*
+ * xSMMU TX CQ poll batching: when enabled (and iommu.xsmmu=1), defer IOTLB sync
+ * to end of mlx5e_poll_tx_cq instead of per-WQE. Disabled by default.
+ */
+bool xsmmu_tx_defer_sync __read_mostly;
+
+static int __init xsmmu_tx_defer_sync_setup(char *str)
+{
+	int ret = kstrtobool(str, &xsmmu_tx_defer_sync);
+
+	if (!ret && xsmmu_tx_defer_sync)
+		pr_info("xSMMU TX CQ poll defer-sync enabled (effective only with iommu.xsmmu=1)\n");
+	return ret;
+}
+early_param("iommu.xsmmu_tx_defer_sync", xsmmu_tx_defer_sync_setup);
+EXPORT_SYMBOL(xsmmu_tx_defer_sync);
+
+/*
  * Debug: track max RX poll release count for tuning pending_release array size.
  * Set iommu.print_poll_release_count=1 to enable. Prints only when max changes.
  * Zero overhead when not set (static key).

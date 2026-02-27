@@ -43,6 +43,7 @@
 #include <net/ipv6.h>
 
 extern bool xsmmu_batch_unmap;
+extern bool xsmmu_tx_defer_sync;
 extern unsigned int iommu_xsmmu_tx_strict_threshold;
 
 static void mlx5e_dma_unmap_wqe_err(struct mlx5e_txqsq *sq, u8 num_dma)
@@ -734,23 +735,41 @@ void mlx5e_sq_xmit_simple(struct mlx5e_txqsq *sq, struct sk_buff *skb, bool xmit
 	mlx5e_sq_xmit_wqe(sq, skb, &attr, &wqe_attr, wqe, pi, xmit_more);
 }
 
-static void mlx5e_tx_wi_dma_unmap(struct mlx5e_txqsq *sq, struct mlx5e_tx_wqe_info *wi,
-				  u32 *dma_fifo_cc)
+/**
+ * mlx5e_tx_wi_dma_unmap - Unmap DMA segments for a completed TX WQE
+ * @sq: TX queue
+ * @wi: WQE info (num_dma, etc.)
+ * @dma_fifo_cc: DMA FIFO consumer (updated)
+ * @defer_sync: true on hot path (poll_tx_cq) to defer IOTLB sync to poll end
+ *
+ * defer_sync and batch (xsmmu) are independent; only one mode is used at a time.
+ * Caller passes defer_sync=true only when xsmmu mode and iommu.xsmmu_tx_defer_sync
+ * are enabled (hot path only). If defer_sync: unmap with no_sync, return true.
+ * If !defer_sync and batch: unmap with no_sync, sync now, return false.
+ * If !defer_sync and !batch: strict unmap per segment, return false.
+ * Returns true iff caller must defer consume.
+ */
+static bool mlx5e_tx_wi_dma_unmap(struct mlx5e_txqsq *sq, struct mlx5e_tx_wqe_info *wi,
+				  u32 *dma_fifo_cc, bool defer_sync)
 {
 	int i;
-	bool batch = xsmmu_batch_unmap && wi->num_dma > iommu_xsmmu_tx_strict_threshold;
+	bool use_no_sync = defer_sync ||
+		(!defer_sync && xsmmu_batch_unmap && wi->num_dma > iommu_xsmmu_tx_strict_threshold);
 
 	for (i = 0; i < wi->num_dma; i++) {
 		struct mlx5e_sq_dma *dma = mlx5e_dma_get(sq, (*dma_fifo_cc)++);
 
-		if (batch)
+		if (use_no_sync)
 			mlx5e_tx_dma_unmap_no_sync(sq->pdev, dma);
 		else
 			mlx5e_tx_dma_unmap(sq->pdev, dma);
 	}
 
-	if (batch)
+	if (defer_sync)
+		return true;
+	if (use_no_sync)
 		dma_sync_device_iotlb(sq->pdev);
+	return false;
 }
 
 static void mlx5e_consume_skb(struct mlx5e_txqsq *sq, struct sk_buff *skb,
@@ -783,16 +802,26 @@ static void mlx5e_tx_wi_consume_fifo_skbs(struct mlx5e_txqsq *sq, struct mlx5e_t
 	}
 }
 
+#define MLX5E_TX_DEFERRED_MAX (MLX5E_TX_CQ_POLL_BUDGET * 2)
+
+struct mlx5e_tx_deferred {
+	struct sk_buff *skb;
+	u8 num_fifo_pkts;
+	u64 cqe_ts;
+};
+
 bool mlx5e_poll_tx_cq(struct mlx5e_cq *cq, int napi_budget)
 {
 	struct mlx5e_sq_stats *stats;
 	struct mlx5e_txqsq *sq;
 	struct mlx5_cqe64 *cqe;
+	struct mlx5e_tx_deferred deferred[MLX5E_TX_DEFERRED_MAX];
+	unsigned int deferred_count = 0;
 	u32 dma_fifo_cc;
 	u32 nbytes;
 	u16 npkts;
 	u16 sqcc;
-	int i;
+	int i, j;
 
 	sq = container_of(cq, struct mlx5e_txqsq, cq);
 
@@ -836,9 +865,39 @@ bool mlx5e_poll_tx_cq(struct mlx5e_cq *cq, int napi_budget)
 			sqcc += wi->num_wqebbs;
 
 			if (likely(wi->skb)) {
-				mlx5e_tx_wi_dma_unmap(sq, wi, &dma_fifo_cc);
-				mlx5e_consume_skb(sq, wi->skb, cqe, napi_budget);
+				if (mlx5e_tx_wi_dma_unmap(sq, wi, &dma_fifo_cc, xsmmu_batch_unmap && xsmmu_tx_defer_sync)) {
+					if (deferred_count < MLX5E_TX_DEFERRED_MAX) {
+						deferred[deferred_count].skb = wi->skb;
+						deferred[deferred_count].num_fifo_pkts = 0;
+						deferred[deferred_count].cqe_ts = get_cqe_ts(cqe);
+						deferred_count++;
+					} else {
+						/* Array full: sync, drain deferred, then consume current */
+						dma_sync_device_iotlb(sq->pdev);
+						for (j = 0; j < deferred_count; j++) {
+							u64 ts = deferred[j].cqe_ts;
+							struct mlx5_cqe64 fake = {};
 
+							fake.timestamp_l = cpu_to_be32((u32)ts);
+							fake.timestamp_h = cpu_to_be32((u32)(ts >> 32));
+							if (deferred[j].skb)
+								mlx5e_consume_skb(sq, deferred[j].skb, &fake, napi_budget);
+							else {
+								u8 n = deferred[j].num_fifo_pkts;
+
+								while (n--) {
+									struct sk_buff *skb = mlx5e_skb_fifo_pop(&sq->db.skb_fifo);
+
+									mlx5e_consume_skb(sq, skb, &fake, napi_budget);
+								}
+							}
+						}
+						deferred_count = 0;
+						mlx5e_consume_skb(sq, wi->skb, cqe, napi_budget);
+					}
+				} else {
+					mlx5e_consume_skb(sq, wi->skb, cqe, napi_budget);
+				}
 				npkts++;
 				nbytes += wi->num_bytes;
 				continue;
@@ -849,9 +908,39 @@ bool mlx5e_poll_tx_cq(struct mlx5e_cq *cq, int napi_budget)
 				continue;
 
 			if (wi->num_fifo_pkts) {
-				mlx5e_tx_wi_dma_unmap(sq, wi, &dma_fifo_cc);
-				mlx5e_tx_wi_consume_fifo_skbs(sq, wi, cqe, napi_budget);
+				if (mlx5e_tx_wi_dma_unmap(sq, wi, &dma_fifo_cc, xsmmu_batch_unmap && xsmmu_tx_defer_sync)) {
+					if (deferred_count < MLX5E_TX_DEFERRED_MAX) {
+						deferred[deferred_count].skb = NULL;
+						deferred[deferred_count].num_fifo_pkts = wi->num_fifo_pkts;
+						deferred[deferred_count].cqe_ts = get_cqe_ts(cqe);
+						deferred_count++;
+					} else {
+						struct mlx5_cqe64 fake = {};
+						u64 ts;
+						u8 n;
 
+						dma_sync_device_iotlb(sq->pdev);
+						for (j = 0; j < deferred_count; j++) {
+							ts = deferred[j].cqe_ts;
+							fake.timestamp_l = cpu_to_be32((u32)ts);
+							fake.timestamp_h = cpu_to_be32((u32)(ts >> 32));
+							if (deferred[j].skb)
+								mlx5e_consume_skb(sq, deferred[j].skb, &fake, napi_budget);
+							else {
+								n = deferred[j].num_fifo_pkts;
+								while (n--) {
+									struct sk_buff *skb = mlx5e_skb_fifo_pop(&sq->db.skb_fifo);
+
+									mlx5e_consume_skb(sq, skb, &fake, napi_budget);
+								}
+							}
+						}
+						deferred_count = 0;
+						mlx5e_tx_wi_consume_fifo_skbs(sq, wi, cqe, napi_budget);
+					}
+				} else {
+					mlx5e_tx_wi_consume_fifo_skbs(sq, wi, cqe, napi_budget);
+				}
 				npkts += wi->num_fifo_pkts;
 				nbytes += wi->num_bytes;
 			}
@@ -869,6 +958,30 @@ bool mlx5e_poll_tx_cq(struct mlx5e_cq *cq, int napi_budget)
 		}
 
 	} while ((++i < MLX5E_TX_CQ_POLL_BUDGET) && (cqe = mlx5_cqwq_get_cqe(&cq->wq)));
+
+	/* Single IOTLB sync for all batch-unmapped WQEs this poll, then drain deferred */
+	if (deferred_count > 0) {
+		struct mlx5_cqe64 fake_cqe = {};
+
+		dma_sync_device_iotlb(sq->pdev);
+		for (j = 0; j < deferred_count; j++) {
+			u64 ts = deferred[j].cqe_ts;
+
+			fake_cqe.timestamp_l = cpu_to_be32((u32)ts);
+			fake_cqe.timestamp_h = cpu_to_be32((u32)(ts >> 32));
+			if (deferred[j].skb) {
+				mlx5e_consume_skb(sq, deferred[j].skb, &fake_cqe, napi_budget);
+			} else {
+				u8 n = deferred[j].num_fifo_pkts;
+
+				while (n--) {
+					struct sk_buff *skb = mlx5e_skb_fifo_pop(&sq->db.skb_fifo);
+
+					mlx5e_consume_skb(sq, skb, &fake_cqe, napi_budget);
+				}
+			}
+		}
+	}
 
 	stats->cqes += i;
 
@@ -916,7 +1029,7 @@ void mlx5e_free_txqsq_descs(struct mlx5e_txqsq *sq)
 		sqcc += wi->num_wqebbs;
 
 		if (likely(wi->skb)) {
-			mlx5e_tx_wi_dma_unmap(sq, wi, &dma_fifo_cc);
+			mlx5e_tx_wi_dma_unmap(sq, wi, &dma_fifo_cc, false);
 			dev_kfree_skb_any(wi->skb);
 
 			npkts++;
@@ -928,7 +1041,7 @@ void mlx5e_free_txqsq_descs(struct mlx5e_txqsq *sq)
 			continue;
 
 		if (wi->num_fifo_pkts) {
-			mlx5e_tx_wi_dma_unmap(sq, wi, &dma_fifo_cc);
+			mlx5e_tx_wi_dma_unmap(sq, wi, &dma_fifo_cc, false);
 			mlx5e_tx_wi_kfree_fifo_skbs(sq, wi);
 
 			npkts += wi->num_fifo_pkts;
