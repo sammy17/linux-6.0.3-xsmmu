@@ -63,6 +63,7 @@
 #endif
 
 extern bool xsmmu_batch_unmap;
+extern bool xsmmu_no_rx_recycle;
 
 static struct sk_buff *
 mlx5e_skb_from_cqe_mpwrq_linear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
@@ -556,6 +557,10 @@ mlx5e_free_rx_mpwqe(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi, bool recycle
 
 	no_xdp_xmit = bitmap_empty(wi->xdp_xmit_bitmap,
 				   MLX5_MPWRQ_PAGES_PER_WQE);
+
+	/* When xSMMU no-recycle experiment is on, force recycle=false for RX MPWQE */
+	if (xsmmu_batch_unmap && xsmmu_no_rx_recycle)
+		recycle = false;
 
 	for (i = 0; i < MLX5_MPWRQ_PAGES_PER_WQE; i++)
 		if (no_xdp_xmit || !test_bit(i, wi->xdp_xmit_bitmap))

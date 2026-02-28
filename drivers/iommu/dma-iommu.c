@@ -94,6 +94,24 @@ static int __init xsmmu_setup(char *str)
 early_param("iommu.xsmmu", xsmmu_setup);
 EXPORT_SYMBOL(xsmmu_batch_unmap);
 
+/*
+ * When set (iommu.xsmmu_no_rx_recycle=1), disable RX page recycling in drivers
+ * that use xsmmu batch unmap (e.g. mlx5 MPWQE). Used to compare effect of
+ * recycle vs no-recycle under xSMMU (e.g. FANDS-style behavior).
+ */
+bool xsmmu_no_rx_recycle __read_mostly;
+
+static int __init xsmmu_no_rx_recycle_setup(char *str)
+{
+	int ret = kstrtobool(str, &xsmmu_no_rx_recycle);
+
+	if (!ret && xsmmu_no_rx_recycle)
+		pr_info("XSMMU: RX recycling disabled (no-recycle experiment)\n");
+	return ret;
+}
+early_param("iommu.xsmmu_no_rx_recycle", xsmmu_no_rx_recycle_setup);
+EXPORT_SYMBOL(xsmmu_no_rx_recycle);
+
 /* RX batch unmap flush threshold (capped by driver pending_release array size) */
 #define IOMMU_NAPI_POLL_THRESHOLD_MAX 1024
 unsigned int iommu_napi_poll_threshold __read_mostly = IOMMU_NAPI_POLL_THRESHOLD_MAX;
