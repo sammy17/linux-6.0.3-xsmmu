@@ -1609,6 +1609,76 @@ static void iommu_dma_unmap_sg(struct device *dev, struct scatterlist *sg,
 		__iommu_dma_unmap(dev, start, end - start);
 }
 
+/**
+ * iommu_dma_unmap_sg_swiotlb_no_sync - Unmap SG via SWIOTLB without IOTLB sync
+ * Used when dev_use_swiotlb(); unmaps each segment with no_sync for batching.
+ */
+static void iommu_dma_unmap_sg_swiotlb_no_sync(struct device *dev,
+		struct scatterlist *sg, int nents, enum dma_data_direction dir,
+		unsigned long attrs)
+{
+	struct scatterlist *s;
+	int i;
+
+	for_each_sg(sg, s, nents, i)
+		iommu_dma_unmap_swiotlb_no_sync(dev, sg_dma_address(s),
+				sg_dma_len(s), dir, attrs);
+}
+
+/**
+ * iommu_dma_unmap_sg_no_sync - Unmap scatterlist without IOTLB invalidation
+ * Same IOVA range logic as iommu_dma_unmap_sg, but calls __iommu_dma_unmap_no_sync
+ * so multiple unmaps can be batched and followed by one dma_sync_device_iotlb().
+ */
+static void iommu_dma_unmap_sg_no_sync(struct device *dev, struct scatterlist *sg,
+		int nents, enum dma_data_direction dir, unsigned long attrs)
+{
+	dma_addr_t end = 0, start;
+	struct scatterlist *tmp;
+	int i;
+
+	if (dev_use_swiotlb(dev)) {
+		iommu_dma_unmap_sg_swiotlb_no_sync(dev, sg, nents, dir, attrs);
+		return;
+	}
+
+	/* No CPU sync in no_sync path; caller handles if needed */
+
+	/*
+	 * The scatterlist segments are mapped into a single
+	 * contiguous IOVA allocation, the start and end points
+	 * just have to be determined.
+	 */
+	for_each_sg(sg, tmp, nents, i) {
+		if (sg_is_dma_bus_address(tmp)) {
+			sg_dma_unmark_bus_address(tmp);
+			continue;
+		}
+
+		if (sg_dma_len(tmp) == 0)
+			break;
+
+		start = sg_dma_address(tmp);
+		break;
+	}
+
+	nents -= i;
+	for_each_sg(tmp, tmp, nents, i) {
+		if (sg_is_dma_bus_address(tmp)) {
+			sg_dma_unmark_bus_address(tmp);
+			continue;
+		}
+
+		if (sg_dma_len(tmp) == 0)
+			break;
+
+		end = sg_dma_address(tmp) + sg_dma_len(tmp);
+	}
+
+	if (end)
+		__iommu_dma_unmap_no_sync(dev, start, end - start);
+}
+
 static dma_addr_t iommu_dma_map_resource(struct device *dev, phys_addr_t phys,
 		size_t size, enum dma_data_direction dir, unsigned long attrs)
 {
@@ -1842,6 +1912,7 @@ static const struct dma_map_ops iommu_dma_ops = {
 	.sync_device_iotlb	= iommu_dma_sync_device_iotlb,
 	.map_sg			= iommu_dma_map_sg,
 	.unmap_sg		= iommu_dma_unmap_sg,
+	.unmap_sg_no_sync	= iommu_dma_unmap_sg_no_sync,
 	.sync_single_for_cpu	= iommu_dma_sync_single_for_cpu,
 	.sync_single_for_device	= iommu_dma_sync_single_for_device,
 	.sync_sg_for_cpu	= iommu_dma_sync_sg_for_cpu,

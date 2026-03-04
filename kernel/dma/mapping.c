@@ -322,6 +322,43 @@ void dma_unmap_sg_attrs(struct device *dev, struct scatterlist *sg,
 }
 EXPORT_SYMBOL(dma_unmap_sg_attrs);
 
+/**
+ * dma_unmap_sg_attrs_no_sync - Unmap scatterlist without IOTLB sync
+ * Unmaps for batch optimization; call dma_sync_device_iotlb() before
+ * reusing or freeing the buffer. Falls back to dma_unmap_sg_attrs if
+ * the driver does not provide unmap_sg_no_sync.
+ */
+void dma_unmap_sg_attrs_no_sync(struct device *dev, struct scatterlist *sg,
+		int nents, enum dma_data_direction dir, unsigned long attrs)
+{
+	const struct dma_map_ops *ops = get_dma_ops(dev);
+
+	BUG_ON(!valid_dma_direction(dir));
+	debug_dma_unmap_sg(dev, sg, nents, dir);
+	if (dma_map_direct(dev, ops) ||
+	    arch_dma_unmap_sg_direct(dev, sg, nents))
+		dma_direct_unmap_sg(dev, sg, nents, dir, attrs);
+	else if (ops->unmap_sg_no_sync)
+		ops->unmap_sg_no_sync(dev, sg, nents, dir, attrs);
+	else
+		dma_unmap_sg_attrs(dev, sg, nents, dir, attrs);
+}
+EXPORT_SYMBOL_GPL(dma_unmap_sg_attrs_no_sync);
+
+/**
+ * dma_supports_batch_unmap - Whether device supports batched unmap + single sync
+ * Returns true if the device's DMA ops provide both unmap_sg_no_sync and
+ * sync_device_iotlb, so callers can batch unmaps and call dma_sync_device_iotlb
+ * once. Used to gate batch-unmap in hot paths only; rare paths use sync unmap.
+ */
+bool dma_supports_batch_unmap(struct device *dev)
+{
+	const struct dma_map_ops *ops = get_dma_ops(dev);
+
+	return ops && ops->unmap_sg_no_sync && ops->sync_device_iotlb;
+}
+EXPORT_SYMBOL_GPL(dma_supports_batch_unmap);
+
 dma_addr_t dma_map_resource(struct device *dev, phys_addr_t phys_addr,
 		size_t size, enum dma_data_direction dir, unsigned long attrs)
 {

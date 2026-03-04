@@ -29,6 +29,10 @@
 #include <linux/sed-opal.h>
 #include <linux/pci-p2pdma.h>
 
+#ifdef CONFIG_IOMMU_DMA
+#include <linux/dma-iommu.h>
+#endif
+
 #include "trace.h"
 #include "nvme.h"
 
@@ -575,6 +579,28 @@ static void nvme_free_sgls(struct nvme_dev *dev, struct request *req)
 	}
 }
 
+/**
+ * nvme_pci_free_rq_data_resources - Free PRP/SGL and sgl after unmap (shared path)
+ * Must be called after IOTLB sync when using no_sync unmap. Used by both
+ * nvme_unmap_data (sync path) and nvme_pci_complete_batch (xSMMU path after sync).
+ */
+static void nvme_pci_free_rq_data_resources(struct nvme_dev *dev, struct request *req)
+{
+	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+
+	if (iod->dma_len)
+		return;
+
+	if (iod->npages == 0)
+		dma_pool_free(dev->prp_small_pool, nvme_pci_iod_list(req)[0],
+			      iod->first_dma);
+	else if (iod->use_sgl)
+		nvme_free_sgls(dev, req);
+	else
+		nvme_free_prps(dev, req);
+	mempool_free(iod->sgt.sgl, dev->iod_mempool);
+}
+
 static void nvme_unmap_data(struct nvme_dev *dev, struct request *req)
 {
 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
@@ -589,14 +615,25 @@ static void nvme_unmap_data(struct nvme_dev *dev, struct request *req)
 
 	dma_unmap_sgtable(dev->dev, &iod->sgt, rq_dma_dir(req), 0);
 
-	if (iod->npages == 0)
-		dma_pool_free(dev->prp_small_pool, nvme_pci_iod_list(req)[0],
-			      iod->first_dma);
-	else if (iod->use_sgl)
-		nvme_free_sgls(dev, req);
-	else
-		nvme_free_prps(dev, req);
-	mempool_free(iod->sgt.sgl, dev->iod_mempool);
+	nvme_pci_free_rq_data_resources(dev, req);
+}
+
+/**
+ * nvme_unmap_data_no_sync - Unmap data buffers without IOTLB sync (xSMMU batch)
+ * Call dma_sync_device_iotlb() before freeing resources or reusing buffers.
+ */
+static void nvme_unmap_data_no_sync(struct nvme_dev *dev, struct request *req)
+{
+	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+
+	if (iod->dma_len) {
+		dma_unmap_page_attrs_no_sync(dev->dev, iod->first_dma, iod->dma_len,
+					     rq_dma_dir(req), 0);
+		return;
+	}
+
+	WARN_ON_ONCE(!iod->sgt.nents);
+	dma_unmap_sgtable_attrs_no_sync(dev->dev, &iod->sgt, rq_dma_dir(req), 0);
 }
 
 static void nvme_print_sgl(struct scatterlist *sgl, int nents)
@@ -1029,14 +1066,78 @@ static __always_inline void nvme_pci_unmap_rq(struct request *req)
 		nvme_unmap_data(dev, req);
 }
 
+/**
+ * nvme_pci_unmap_rq_no_sync - Unmap request DMA without IOTLB sync (xSMMU batch)
+ * Does not free PRP/SGL; call nvme_pci_free_rq_data_resources after
+ * dma_sync_device_iotlb().
+ */
+static void nvme_pci_unmap_rq_no_sync(struct request *req)
+{
+	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+	struct nvme_dev *dev = iod->nvmeq->dev;
+
+	if (blk_integrity_rq(req))
+		dma_unmap_page_attrs_no_sync(dev->dev, iod->meta_dma,
+				rq_integrity_vec(req)->bv_len, rq_data_dir(req), 0);
+	if (blk_rq_nr_phys_segments(req))
+		nvme_unmap_data_no_sync(dev, req);
+}
+
+/**
+ * nvme_pci_free_rq_resources - Free request resources after IOTLB sync (xSMMU batch)
+ * Call only after dma_sync_device_iotlb() when request was unmapped with _no_sync.
+ */
+static void nvme_pci_free_rq_resources(struct request *req)
+{
+	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+	struct nvme_dev *dev = iod->nvmeq->dev;
+
+	nvme_pci_free_rq_data_resources(dev, req);
+}
+
 static void nvme_pci_complete_rq(struct request *req)
 {
 	nvme_pci_unmap_rq(req);
 	nvme_complete_rq(req);
 }
 
+#ifdef CONFIG_IOMMU_DMA
+extern bool xsmmu_batch_unmap;
+#endif
+
+/*
+ * Batch completion (hot path only): when iommu.xsmmu=1 and the device supports
+ * batch unmap, we unmap all requests without IOTLB sync, then sync once and
+ * free. Single completions and rare paths (error, teardown) use
+ * nvme_pci_complete_rq and stay on sync unmap.
+ */
 static void nvme_pci_complete_batch(struct io_comp_batch *iob)
 {
+#ifdef CONFIG_IOMMU_DMA
+	{
+		struct request *first = rq_list_peek(&iob->req_list);
+		struct nvme_iod *first_iod = first ? (struct nvme_iod *)blk_mq_rq_to_pdu(first) : NULL;
+
+		if (xsmmu_batch_unmap && first_iod &&
+		    dma_supports_batch_unmap(first_iod->nvmeq->dev->dev)) {
+			struct request *req;
+			struct nvme_dev *dev = first_iod->nvmeq->dev;
+
+		/* Unmap all requests without IOTLB sync */
+		rq_list_for_each(&iob->req_list, req)
+			nvme_pci_unmap_rq_no_sync(req);
+		/* Single domain-wide IOTLB invalidation for the batch */
+		dma_sync_device_iotlb(dev->dev);
+		/* Free resources and complete each request */
+		rq_list_for_each(&iob->req_list, req) {
+			nvme_pci_free_rq_resources(req);
+			nvme_complete_batch_req(req);
+		}
+		blk_mq_end_request_batch(iob);
+		return;
+		}
+	}
+#endif
 	nvme_complete_batch(iob, nvme_pci_unmap_rq);
 }
 

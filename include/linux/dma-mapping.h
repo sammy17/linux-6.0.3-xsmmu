@@ -110,11 +110,14 @@ void dma_unmap_page_attrs_no_sync(struct device *dev, dma_addr_t addr,
 void dma_unmap_single_attrs_no_sync(struct device *dev, dma_addr_t addr,
 		size_t size, enum dma_data_direction dir, unsigned long attrs);
 void dma_sync_device_iotlb(struct device *dev);
+bool dma_supports_batch_unmap(struct device *dev);
 unsigned int dma_map_sg_attrs(struct device *dev, struct scatterlist *sg,
 		int nents, enum dma_data_direction dir, unsigned long attrs);
 void dma_unmap_sg_attrs(struct device *dev, struct scatterlist *sg,
 				      int nents, enum dma_data_direction dir,
 				      unsigned long attrs);
+void dma_unmap_sg_attrs_no_sync(struct device *dev, struct scatterlist *sg,
+		int nents, enum dma_data_direction dir, unsigned long attrs);
 int dma_map_sgtable(struct device *dev, struct sg_table *sgt,
 		enum dma_data_direction dir, unsigned long attrs);
 dma_addr_t dma_map_resource(struct device *dev, phys_addr_t phys_addr,
@@ -182,6 +185,20 @@ static inline void dma_unmap_sg_attrs(struct device *dev,
 		struct scatterlist *sg, int nents, enum dma_data_direction dir,
 		unsigned long attrs)
 {
+}
+static inline void dma_unmap_sg_attrs_no_sync(struct device *dev,
+		struct scatterlist *sg, int nents, enum dma_data_direction dir,
+		unsigned long attrs)
+{
+}
+static inline void dma_unmap_sgtable_attrs_no_sync(struct device *dev,
+		struct sg_table *sgt, enum dma_data_direction dir,
+		unsigned long attrs)
+{
+}
+static inline bool dma_supports_batch_unmap(struct device *dev)
+{
+	return false;
 }
 static inline int dma_map_sgtable(struct device *dev, struct sg_table *sgt,
 		enum dma_data_direction dir, unsigned long attrs)
@@ -379,6 +396,23 @@ static inline void dma_unmap_sgtable(struct device *dev, struct sg_table *sgt,
 }
 
 /**
+ * dma_unmap_sgtable_attrs_no_sync - Unmap sg_table without IOTLB sync
+ * @dev:	The device for which to perform the DMA operation
+ * @sgt:	The sg_table object describing the buffer
+ * @dir:	DMA direction
+ * @attrs:	Optional DMA attributes
+ *
+ * Unmaps the buffer for batch optimization; call dma_sync_device_iotlb()
+ * before reusing or freeing the buffer.
+ */
+static inline void dma_unmap_sgtable_attrs_no_sync(struct device *dev,
+		struct sg_table *sgt, enum dma_data_direction dir,
+		unsigned long attrs)
+{
+	dma_unmap_sg_attrs_no_sync(dev, sgt->sgl, sgt->orig_nents, dir, attrs);
+}
+
+/**
  * dma_sync_sgtable_for_cpu - Synchronize the given buffer for CPU access
  * @dev:	The device for which to perform the DMA operation
  * @sgt:	The sg_table object describing the buffer
@@ -419,6 +453,8 @@ static inline void dma_sync_sgtable_for_device(struct device *dev,
 	dma_unmap_single_attrs_no_sync(d, a, s, r, 0)
 #define dma_map_sg(d, s, n, r) dma_map_sg_attrs(d, s, n, r, 0)
 #define dma_unmap_sg(d, s, n, r) dma_unmap_sg_attrs(d, s, n, r, 0)
+#define dma_unmap_sg_no_sync(d, s, n, r) \
+	dma_unmap_sg_attrs_no_sync(d, s, n, r, 0)
 #define dma_map_page(d, p, o, s, r) dma_map_page_attrs(d, p, o, s, r, 0)
 #define dma_unmap_page(d, a, s, r) dma_unmap_page_attrs(d, a, s, r, 0)
 #define dma_unmap_page_no_sync(d, a, s, r) \
