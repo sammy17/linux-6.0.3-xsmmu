@@ -75,6 +75,11 @@ static atomic64_t iotlb_inv_dsi_xsmmu_count;  /* xSMMU DSI with IH=1 */
 atomic64_t iotlb_unmapped_iova_pages;         /* 4KB IOVA pages unmapped */
 static struct delayed_work iotlb_stats_work;
 
+#ifdef CONFIG_IOMMU_DMA
+extern bool xsmmu_batch_unmap;
+extern bool xsmmu_flush_ptw_cache;
+#endif
+
 static int __init print_iotlb_inv_count_setup(char *str)
 {
 	int ret = kstrtobool(str, &print_iotlb_inv_count);
@@ -1685,16 +1690,26 @@ void qi_flush_piotlb(struct intel_iommu *iommu, u16 did, u32 pasid, u64 addr,
  * @iommu: intel iommu
  * @did: domain id
  *
- * Performs domain-selective IOTLB invalidation with invalidation hint (IH=1)
- * set, which skips page walk cache invalidation. Used for batch unmap
- * optimization where pages remain in flush queue until full invalidation.
+ * Performs domain-selective IOTLB invalidation for xSMMU batch unmap.
+ * By default it sets invalidation hint (IH=1), which skips page walk cache
+ * invalidation. When iommu.xsmmu_flush_ptw_cache=1 is set while xSMMU mode
+ * is enabled (iommu.xsmmu=1), IH is cleared so both IOTLB and page-walk
+ * cache are invalidated.
+ *
+ * Used for batch unmap optimization where pages remain in the flush queue
+ * until full invalidation. Waits synchronously for invalidation completion.
  * Waits synchronously for invalidation completion.
  */
 void qi_flush_domain_iotlb_hint(struct intel_iommu *iommu, u16 did)
 {
 	u8 dw = 0, dr = 0;
 	struct qi_desc desc;
-	int ih = 1;  /* Set invalidation hint to skip page walk cache */
+	int ih = 1;  /* Default: IH=1, skip page-walk cache */
+
+#ifdef CONFIG_IOMMU_DMA
+	if (xsmmu_batch_unmap && xsmmu_flush_ptw_cache)
+		ih = 0;
+#endif
 
 	if (cap_write_drain(iommu->cap))
 		dw = 1;

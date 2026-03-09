@@ -72,6 +72,7 @@ struct iommu_dma_cookie {
 static DEFINE_STATIC_KEY_FALSE(iommu_deferred_attach_enabled);
 bool iommu_dma_forcedac __read_mostly;
 bool xsmmu_batch_unmap __read_mostly;
+bool xsmmu_flush_ptw_cache __read_mostly;
 
 static int __init iommu_dma_forcedac_setup(char *str)
 {
@@ -93,6 +94,17 @@ static int __init xsmmu_setup(char *str)
 }
 early_param("iommu.xsmmu", xsmmu_setup);
 EXPORT_SYMBOL(xsmmu_batch_unmap);
+
+static int __init xsmmu_flush_ptw_cache_setup(char *str)
+{
+	int ret = kstrtobool(str, &xsmmu_flush_ptw_cache);
+
+	if (!ret && xsmmu_flush_ptw_cache)
+		pr_info("XSMMU: domain invalidations will also flush page-walk cache\n");
+	return ret;
+}
+early_param("iommu.xsmmu_flush_ptw_cache", xsmmu_flush_ptw_cache_setup);
+EXPORT_SYMBOL(xsmmu_flush_ptw_cache);
 
 /*
  * When set (iommu.xsmmu_no_rx_recycle=1), disable RX page recycling in drivers

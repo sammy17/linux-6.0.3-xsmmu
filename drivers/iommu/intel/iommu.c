@@ -4373,15 +4373,13 @@ static void intel_iommu_tlb_sync(struct iommu_domain *domain,
 }
 
 /**
- * intel_sync_domain_iotlb - Synchronously invalidate domain IOTLB with hint
+ * intel_sync_domain_iotlb - Synchronously invalidate domain IOTLB for xSMMU
  * @domain: iommu domain
  *
- * Performs domain-selective IOTLB invalidation with invalidation hint (IH=1)
- * set, which skips page walk cache invalidation. This is used for batch unmap
- * optimization where:
- * 1. Multiple pages are unmapped and added to flush queue
- * 2. This function invalidates IOTLB entries (but not page walk cache)
- * 3. Pages remain in flush queue until full invalidation clears page walk cache
+ * Performs domain-selective IOTLB invalidation for xSMMU batch unmap. By
+ * default, invalidation hint (IH=1) is used so page-walk cache is not
+ * invalidated. When iommu.xsmmu_flush_ptw_cache=1 is set (with xSMMU mode
+ * enabled), IH is cleared and both IOTLB and page-walk cache are invalidated.
  *
  * Note: Invalidates the entire domain (all devices sharing this domain).
  */
